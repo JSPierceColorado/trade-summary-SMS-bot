@@ -2,14 +2,14 @@ import os
 import json
 import requests
 import gspread
-from datetime import datetime
+from datetime import datetime, UTC
 
 SHEET_NAME = "Trading Log"
 LOG_TAB = "log"
 
-MAILGUN_DOMAIN = os.getenv("MAILGUN_DOMAIN")  # e.g. sandbox1234.mailgun.org
+MAILGUN_DOMAIN = os.getenv("MAILGUN_DOMAIN")  # e.g. sandboxXXXX.mailgun.org or mg.yourdomain.com
 MAILGUN_API_KEY = os.getenv("MAILGUN_API_KEY")
-EMAIL_FROM = os.getenv("EMAIL_FROM")          # e.g. 'Bot <bot@yourdomain.com>' or 'bot@sandbox1234.mailgun.org'
+EMAIL_FROM = os.getenv("EMAIL_FROM")          # e.g. bot@sandboxXXXX.mailgun.org
 EMAIL_TO = os.getenv("EMAIL_TO")              # your email
 
 def get_google_client():
@@ -17,42 +17,61 @@ def get_google_client():
     return gspread.service_account_from_dict(creds)
 
 def get_today_trades(ws):
+    """Return (header, today_rows). 'Today' is matched by UTC date substring in Timestamp."""
     rows = ws.get_all_values()
     if not rows or len(rows) < 2:
         return [], []
+
     header = rows[0]
+    # Be strict about column naming but fail gracefully
     if "Timestamp" not in header:
-        print(f"No 'Timestamp' in headers: {header}")
+        print(f"⚠️ No 'Timestamp' in headers: {header}")
         return header, []
+
     ts_idx = header.index("Timestamp")
-    today_str = datetime.utcnow().strftime("%Y-%m-%d")
-    today_trades = [row for row in rows[1:] if len(row) > ts_idx and today_str in row[ts_idx]]
+    today_str = datetime.now(UTC).strftime("%Y-%m-%d")
+
+    today_trades = [
+        row for row in rows[1:]
+        if len(row) > ts_idx and row[ts_idx] and today_str in row[ts_idx]
+    ]
     return header, today_trades
 
-def summarize_trades(header, trades):
+def summarize_counts(header, trades):
+    """Return (num_buys, num_sells). We treat any sell as 'profit made' per your bot logic."""
+    if not trades:
+        return 0, 0
+    if "Side" not in header:
+        return 0, 0
+    side_idx = header.index("Side")
+    buys = 0
+    sells = 0
+    for row in trades:
+        if len(row) <= side_idx:
+            continue
+        side = (row[side_idx] or "").strip().lower()
+        if side == "buy":
+            buys += 1
+        elif side == "sell":
+            sells += 1
+    return buys, sells
+
+def build_subject(buys, sells, had_trades):
+    if not had_trades:
+        return "Bot: No trades today"
+    profit_flag = "Profit made" if sells > 0 else "No profit"
+    return f"Bot: Bought {buys} • {profit_flag}"
+
+def build_body(header, trades, buys, sells):
     if not trades:
         return "No trades today. Bot ran successfully."
-    side_idx = header.index("Side")
-    notional_idx = header.index("Notional") if "Notional" in header else None
-    price_idx = header.index("Price") if "Price" in header else None
-
-    buys = [row for row in trades if row[side_idx].strip().lower() == "buy"]
-    sells = [row for row in trades if row[side_idx].strip().lower() == "sell"]
-
-    profit = 0.0
-    if sells and price_idx is not None:
-        profit += sum(float(row[price_idx]) if row[price_idx] else 0 for row in sells)
-    if buys and notional_idx is not None:
-        profit -= sum(float(row[notional_idx]) if row[notional_idx] else 0 for row in buys)
-
-    msg_parts = []
+    parts = []
     if buys:
-        msg_parts.append(f"Bought {len(buys)} stocks")
+        parts.append(f"Bought {buys} stocks")
     if sells:
-        msg_parts.append(f"Sold {len(sells)} stocks")
-    msg_parts.append(f"Generated ${profit:.2f} profit today.")
-
-    return ". ".join(msg_parts)
+        parts.append(f"Sold {sells} stocks")
+    # Keep it short and text-like
+    return ". ".join(parts) + "."
 
 def send_mailgun_email(subject, body):
     url = f"https://api.mailgun.net/v3/{MAILGUN_DOMAIN}/messages"
@@ -63,19 +82,24 @@ def send_mailgun_email(subject, body):
         "subject": subject,
         "text": body,
     }
-    response = requests.post(url, auth=auth, data=data)
-    if response.status_code == 200:
+    resp = requests.post(url, auth=auth, data=data)
+    if resp.status_code == 200:
         print("✅ Email sent via Mailgun")
     else:
-        print(f"❌ Mailgun error: {response.status_code}, {response.text}")
+        print(f"❌ Mailgun error: {resp.status_code}, {resp.text}")
 
 def main():
     gc = get_google_client()
     log_ws = gc.open(SHEET_NAME).worksheet(LOG_TAB)
+
     header, trades = get_today_trades(log_ws)
-    summary = summarize_trades(header, trades)
-    print("Email body:", summary)
-    send_mailgun_email("Trading bot daily summary", summary)
+    buys, sells = summarize_counts(header, trades)
+    subject = build_subject(buys, sells, had_trades=bool(trades))
+    body = build_body(header, trades, buys, sells)
+
+    print("Email subject:", subject)
+    print("Email body:", body)
+    send_mailgun_email(subject, body)
 
 if __name__ == "__main__":
     main()
